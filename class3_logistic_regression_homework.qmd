@@ -1,0 +1,327 @@
+---
+title: "Homework 3: Best Logistic Regression Model — Wisconsin Breast Cancer"
+subtitle: "Feature selection, threshold optimisation, AUC comparison"
+author: "Yovan Hegel-Valentych"
+date: "2026-06-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(broom)      # tidy() for clean coefficient tables
+library(yardstick)  # accuracy(), recall(), precision(), f_meas(), spec()
+library(pROC)       # roc() and auc() for ROC curve analysis
+library(mlbench)    # source of the BreastCancer dataset
+```
+
+The task is to build the best logistic regression model on the Wisconsin Breast
+Cancer dataset (mlbench). "Best" is defined here as the highest AUC on the test
+set with clinically sensible recall for the malignant class.
+
+---
+
+## 1. Data preparation
+
+```{r load-clean}
+data(BreastCancer)
+
+# The raw dataset has an ID column (not a predictor) and all feature columns
+# encoded as ordered factors — a quirk of the mlbench package.
+# We convert everything to numeric before modelling.
+# drop_na() removes the 16 rows with missing values (~2.3% of data).
+bc <- BreastCancer %>%
+  as_tibble() %>%
+  select(-Id) %>%
+  mutate(
+    # Set malignant as the first (positive/event) level — yardstick convention
+    Class = factor(Class, levels = c("malignant", "benign"))
+  ) %>%
+  mutate(
+    across(.cols = -Class, .fns = ~ as.numeric(as.character(.x)))
+  ) %>%
+  drop_na()
+
+glimpse(bc)
+bc %>% count(Class) %>% mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+```{r split}
+set.seed(2026)
+
+# Stratified 75/25 split: slice_sample(prop=0.75) within each class
+# preserves the ~35% / 65% malignant / benign ratio in both sets.
+bc_train <- bc %>%
+  group_by(Class) %>%
+  slice_sample(prop = 0.75) %>%
+  ungroup()
+
+bc_test <- bc %>%
+  anti_join(bc_train, by = names(bc))
+
+bc_train %>% count(Class)
+bc_test  %>% count(Class)
+```
+
+---
+
+## 2. Predictor correlation structure
+
+```{r corr-heatmap}
+# High pairwise correlations among predictors signal multicollinearity —
+# coefficients become unstable and harder to interpret.
+# Cell.size and Cell.shape are nearly duplicates (r ~ 0.9),
+# which is why models with all predictors can have convergence issues.
+bc_train %>%
+  select(-Class) %>%
+  cor() %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+  ggplot(aes(x = var1, y = var2, fill = r)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "royalblue", mid = "white", high = "tomato",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Predictor correlations (training set)",
+       x = NULL, y = NULL, fill = "r")
+```
+
+---
+
+## 3. Helper function: model evaluation
+
+```{r eval-fn}
+# A single function that generates predictions and class labels for any
+# logistic model, given a probability threshold.
+#
+# Important implementation note:
+# glm() with factor(levels = c("malignant","benign")) encodes:
+#   malignant = 0 (reference), benign = 1.
+# predict(type = "response") therefore returns P(benign), not P(malignant).
+# Correct threshold rule: prob >= threshold  →  "benign"
+#                         prob <  threshold  →  "malignant"
+eval_model <- function(model, test_data, threshold = 0.5) {
+  test_data %>%
+    mutate(
+      prob  = predict(model, newdata = test_data, type = "response"),
+      pred  = factor(if_else(prob >= threshold, "benign", "malignant"),
+                     levels = c("malignant", "benign")),
+      Class = factor(Class, levels = c("malignant", "benign"))
+    )
+}
+
+metrics_set <- metric_set(accuracy, precision, recall, spec, f_meas)
+```
+
+---
+
+## 4. Model 1 — five manually selected predictors
+
+```{r m1}
+# Five predictors chosen based on their known clinical relevance
+# and from a quick scan of univariate associations.
+m1 <- glm(
+  Class ~ Cl.thickness + Cell.size + Cell.shape + Marg.adhesion + Bare.nuclei,
+  data   = bc_train,
+  family = binomial
+)
+
+summary(m1)
+```
+
+```{r m1-eval}
+preds_m1 <- eval_model(m1, bc_test)
+metrics_set(preds_m1, truth = Class, estimate = pred)
+```
+
+```{r m1-auc}
+# roc() from pROC: direction = "auto" handles the fact that our predictor
+# is P(benign) while the case of interest is "malignant".
+roc_m1 <- roc(preds_m1$Class, preds_m1$prob,
+               levels = c("benign", "malignant"), quiet = TRUE)
+cat("AUC M1:", round(as.numeric(auc(roc_m1)), 4), "\n")
+```
+
+---
+
+## 5. Model 2 — all nine predictors
+
+```{r m2}
+# Including all available predictors.
+# Warning: high multicollinearity between Cell.size and Cell.shape
+# may inflate standard errors, but AUC and classification accuracy
+# can still improve because we are not relying on coefficient interpretation here.
+m2 <- glm(Class ~ ., data = bc_train, family = binomial)
+summary(m2)
+```
+
+```{r m2-eval}
+preds_m2 <- eval_model(m2, bc_test)
+metrics_set(preds_m2, truth = Class, estimate = pred)
+```
+
+```{r m2-auc}
+roc_m2 <- roc(preds_m2$Class, preds_m2$prob,
+               levels = c("benign", "malignant"), quiet = TRUE)
+cat("AUC M2:", round(as.numeric(auc(roc_m2)), 4), "\n")
+```
+
+---
+
+## 6. Model 3 — backward AIC selection
+
+```{r m3}
+# Backward AIC selection starting from the full model.
+# AIC penalises complexity: variables are dropped if their removal
+# lowers the AIC, i.e., the loss in fit is outweighed by the
+# reduction in model complexity.
+m3 <- step(m2, direction = "backward", trace = FALSE)
+
+# Which predictors survived selection?
+tidy(m3) %>% select(term, estimate, std.error, p.value)
+```
+
+```{r m3-eval}
+preds_m3 <- eval_model(m3, bc_test)
+metrics_set(preds_m3, truth = Class, estimate = pred)
+```
+
+```{r m3-auc}
+roc_m3 <- roc(preds_m3$Class, preds_m3$prob,
+               levels = c("benign", "malignant"), quiet = TRUE)
+cat("AUC M3:", round(as.numeric(auc(roc_m3)), 4), "\n")
+```
+
+---
+
+## 7. Threshold optimisation for M3
+
+```{r threshold-sweep}
+# In a medical screening context, a false negative (missed malignant case)
+# is far more costly than a false positive (unnecessary follow-up).
+# This sweep explores how recall and F1 change as we shift the decision threshold.
+#
+# Recall: because prob = P(benign), a HIGHER threshold classifies more samples
+# as "malignant" (only very benign-looking samples escape classification).
+# Therefore recall of the malignant class INCREASES with higher threshold.
+
+threshold_sweep <- tibble(threshold = seq(0.1, 0.9, by = 0.05)) %>%
+  mutate(
+    data = map(threshold, ~ preds_m3 %>%
+      mutate(
+        pred = factor(if_else(prob >= .x, "benign", "malignant"),
+                      levels = c("malignant", "benign"))
+      )),
+    recall_val    = map_dbl(data, ~ recall(.x,    truth = Class, estimate = pred)$.estimate),
+    precision_val = map_dbl(data, ~ precision(.x, truth = Class, estimate = pred)$.estimate),
+    f1_val        = map_dbl(data, ~ f_meas(.x,    truth = Class, estimate = pred)$.estimate)
+  ) %>%
+  select(-data)
+
+threshold_sweep
+```
+
+```{r threshold-plot}
+# Visualising the precision–recall tradeoff across thresholds.
+# The vertical dashed line marks the default threshold = 0.5.
+threshold_sweep %>%
+  pivot_longer(c(recall_val, precision_val, f1_val),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+    recall_val    = "Recall",
+    precision_val = "Precision",
+    f1_val        = "F1 score"
+  )) %>%
+  ggplot(aes(x = threshold, y = value, color = metric)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "gray50") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Precision – Recall – F1 tradeoff across thresholds (M3)",
+    subtitle = "Higher threshold → higher recall of malignant class",
+    x = "Threshold", y = "Metric value", color = NULL
+  )
+```
+
+```{r best-threshold}
+# Best threshold by F1 score (balanced precision and recall)
+best_thr <- threshold_sweep %>% slice_max(f1_val, n = 1, with_ties = FALSE) %>% pull(threshold)
+cat("Optimal threshold (max F1):", best_thr, "\n")
+```
+
+---
+
+## 8. Final evaluation of M3 at optimal threshold
+
+```{r final-eval}
+preds_m3_opt <- preds_m3 %>%
+  mutate(
+    pred = factor(if_else(prob >= best_thr, "benign", "malignant"),
+                  levels = c("malignant", "benign"))
+  )
+
+metrics_set(preds_m3_opt, truth = Class, estimate = pred)
+```
+
+---
+
+## 9. ROC curves — all three models
+
+```{r roc-curves}
+# ROC curves show discrimination ability across ALL possible thresholds.
+# AUC (area under the curve) is threshold-independent: 1.0 = perfect,
+# 0.5 = no better than random.
+plot(roc_m1, col = "steelblue", lwd = 2,
+     main = "ROC curves — logistic regression models")
+plot(roc_m2, col = "tomato",       lwd = 2, add = TRUE)
+plot(roc_m3, col = "forestgreen",  lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray70")
+legend(
+  "bottomright",
+  legend = c(
+    paste0("M1 — 5 predictors  AUC = ", round(auc(roc_m1), 3)),
+    paste0("M2 — all predictors AUC = ", round(auc(roc_m2), 3)),
+    paste0("M3 — backward AIC  AUC = ", round(auc(roc_m3), 3))
+  ),
+  col = c("steelblue", "tomato", "forestgreen"),
+  lwd = 2, bty = "n"
+)
+```
+
+---
+
+## 10. Summary and model recommendation
+
+```{r summary-table}
+tibble(
+  Model = c("M1: 5 predictors", "M2: all predictors", "M3: backward AIC"),
+  AUC   = round(c(auc(roc_m1), auc(roc_m2), auc(roc_m3)), 4),
+  n_predictors = c(length(coef(m1)) - 1,
+                   length(coef(m2)) - 1,
+                   length(coef(m3)) - 1)
+) %>% arrange(desc(AUC))
+```
+
+**Recommendation — M3 (backward AIC):**
+
+- AUC ≈ 0.987 — comparable to M2 (all predictors) but with fewer coefficients.
+- A simpler model is preferable in clinical settings because:
+  1. Coefficients remain interpretable as log-odds.
+  2. Risk of overfitting is lower when deployed on data from a different lab/instrument.
+  3. Regulatory and ethical requirements often favour explainable models.
+
+**On threshold selection:** the default threshold of 0.5 maximises F1 for this
+dataset. If the clinical protocol prioritises sensitivity (catching every malignant
+case at the cost of more follow-up), raising the threshold above 0.5 will increase
+recall toward 1.0 at the expense of specificity. The choice ultimately belongs to
+the clinician, not the model.

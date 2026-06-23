@@ -1,0 +1,278 @@
+---
+title: "Homework 4: PCA and Dimensionality Reduction — Extension"
+subtitle: "How many principal components are enough for classification on WDBC?"
+author: "Yovan Hegel-Valentych"
+date: "2026-06-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(yardstick)
+library(pROC)
+```
+
+The practical covered the mechanics of PCA and showed that dimensionality can be
+reduced while preserving the bulk of variance. This extension asks a quantitative
+question: **how many principal components are actually needed to maintain
+classification performance close to the full-feature baseline?**
+
+The answer has practical importance in biomedical data (high-dimensional omics,
+imaging features) where fitting models on 30+ raw features is often unnecessary,
+unstable, or uninterpretable.
+
+---
+
+## 1. Load and prepare data
+
+```{r load}
+wdbc_raw <- read_csv("../materials/Class 4/breast-cancer.csv",
+                     show_col_types = FALSE)
+
+# Sanitise column names: spaces, hyphens, and dots → underscores, all lowercase.
+# This avoids backtick-quoting headaches in formulas and dplyr pipes.
+names(wdbc_raw) <- names(wdbc_raw) %>%
+  str_replace_all("[ \\-\\.]", "_") %>%
+  str_to_lower()
+
+wdbc <- wdbc_raw %>%
+  # Positive class first — yardstick and pROC conventions
+  mutate(diagnosis = factor(diagnosis, levels = c("M", "B"))) %>%
+  select(-id)  # ID is a row identifier, not a predictor
+
+glimpse(wdbc)
+wdbc %>% count(diagnosis) %>% mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+---
+
+## 2. Stratified train / test split
+
+```{r split}
+set.seed(2026)
+
+# Stratified sampling within each class ensures both sets have ~37% M / 63% B.
+# Using anti_join on all columns to extract the exact complement of train rows.
+wdbc_train <- wdbc %>%
+  group_by(diagnosis) %>%
+  slice_sample(prop = 0.75) %>%
+  ungroup()
+
+wdbc_test <- wdbc %>%
+  anti_join(wdbc_train, by = names(wdbc))
+
+cat("Train:", nrow(wdbc_train), "| Test:", nrow(wdbc_test), "\n")
+wdbc_train %>% count(diagnosis)
+```
+
+```{r matrices}
+# Separate feature matrices and target vectors for PCA and downstream modelling.
+x_train <- wdbc_train %>% select(-diagnosis) %>% as.matrix()
+y_train  <- wdbc_train$diagnosis
+x_test   <- wdbc_test  %>% select(-diagnosis) %>% as.matrix()
+y_test   <- wdbc_test$diagnosis
+```
+
+---
+
+## 3. Standardise features
+
+```{r scale}
+# PCA is sensitive to scale: a feature with large variance dominates the
+# principal components regardless of its biological relevance.
+# Standardisation (mean = 0, sd = 1) removes this bias.
+#
+# IMPORTANT: mean and SD are computed ONLY on the training set and then
+# applied to the test set. Using test statistics here would constitute
+# data leakage.
+train_means <- colMeans(x_train)
+train_sds   <- apply(x_train, 2, sd)
+
+x_train_sc <- scale(x_train, center = train_means, scale = train_sds)
+x_test_sc  <- scale(x_test,  center = train_means, scale = train_sds)
+```
+
+---
+
+## 4. Fit PCA on training data
+
+```{r pca}
+# prcomp() returns: rotation matrix (loadings), x (scores), sdev (std deviations).
+# center = FALSE and scale. = FALSE because we already standardised manually.
+pca_fit <- prcomp(x_train_sc, center = FALSE, scale. = FALSE)
+
+var_exp <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+cum_var <- cumsum(var_exp)
+
+n_pc_90 <- which(cum_var >= 0.90)[1]
+n_pc_95 <- which(cum_var >= 0.95)[1]
+cat("PCs to explain 90% variance:", n_pc_90, "\n")
+cat("PCs to explain 95% variance:", n_pc_95, "\n")
+```
+
+```{r scree}
+# Scree plot with cumulative variance overlay.
+# The "elbow" in the scree (bar chart) often suggests a natural cutoff,
+# but the cumulative line with a 90% threshold is more objective.
+tibble(pc = seq_along(var_exp), ve = var_exp, cv = cum_var) %>%
+  filter(pc <= 20) %>%
+  ggplot(aes(x = pc)) +
+  geom_col(aes(y = ve), fill = "steelblue", alpha = 0.7) +
+  geom_line(aes(y = cv), color = "tomato", linewidth = 1.2) +
+  geom_point(aes(y = cv), color = "tomato", size = 2.5) +
+  geom_hline(yintercept = 0.90, linetype = "dashed", color = "gray50") +
+  annotate("text", x = n_pc_90 + 0.5, y = 0.87,
+           label = paste0("90% @ PC", n_pc_90), hjust = 0, size = 3.5) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Scree plot with cumulative explained variance",
+    subtitle = "Bars = individual PC contribution; line = cumulative sum",
+    x = "Principal Component", y = "Proportion of variance explained"
+  )
+```
+
+---
+
+## 5. PC1 vs PC2 scatter
+
+```{r biplot}
+# PC1 and PC2 together explain the largest possible fraction of variance
+# in two dimensions. A clean separation here suggests the two classes
+# differ primarily along the directions of maximum variance — a good sign
+# for any downstream linear classifier.
+as_tibble(pca_fit$x[, 1:2]) %>%
+  mutate(diagnosis = y_train) %>%
+  ggplot(aes(x = PC1, y = PC2, color = diagnosis)) +
+  geom_point(alpha = 0.7, size = 2.2) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "PCA score plot: PC1 vs PC2 (training set)",
+    x = paste0("PC1 (", round(var_exp[1] * 100, 1), "% variance)"),
+    y = paste0("PC2 (", round(var_exp[2] * 100, 1), "% variance)"),
+    color = "Diagnosis"
+  )
+```
+
+---
+
+## 6. Classification performance vs number of PCs
+
+```{r pca-logistic}
+# For each candidate number of PCs:
+#   1. Project train and test data onto the first k PCs
+#   2. Fit logistic regression on the projected training data
+#   3. Predict on the projected test data
+#   4. Compute AUC, accuracy, and recall
+#
+# Note on GLM warnings: "fitted probabilities numerically 0 or 1 occurred"
+# indicates perfect or near-perfect separation of classes in the PC space.
+# This is expected for WDBC at k >= 5 — the classes ARE well-separated.
+# The GLM still converges and produces meaningful AUC, though coefficient
+# SEs are inflated (not an issue here since we care about prediction).
+
+fit_pca_logistic <- function(n_components) {
+  # Project onto first k PCs using the PCA fit from training data only
+  train_pca <- as_tibble(pca_fit$x[, 1:n_components]) %>%
+    mutate(diagnosis = y_train)
+
+  test_pca <- as_tibble(
+    predict(pca_fit, newdata = x_test_sc)[, 1:n_components]
+  ) %>%
+    mutate(diagnosis = y_test)
+
+  # Fit logistic regression in the reduced PC space
+  model <- suppressWarnings(
+    glm(diagnosis ~ ., data = train_pca, family = binomial,
+        control = glm.control(maxit = 200))
+  )
+
+  # predict(type="response") returns P(B) because levels = c("M","B")
+  # Correct threshold: prob >= 0.5 → "B"
+  preds <- test_pca %>%
+    mutate(
+      prob      = predict(model, newdata = test_pca, type = "response"),
+      pred      = factor(if_else(prob >= 0.5, "B", "M"), levels = c("M", "B")),
+      diagnosis = factor(diagnosis, levels = c("M", "B"))
+    )
+
+  roc_obj <- suppressMessages(
+    roc(preds$diagnosis, preds$prob, levels = c("B", "M"))
+  )
+
+  tibble(
+    n_components = n_components,
+    auc          = round(as.numeric(auc(roc_obj)), 4),
+    accuracy     = round(accuracy(preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    recall       = round(recall(preds,   truth = diagnosis, estimate = pred)$.estimate, 4),
+    precision    = round(precision(preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    f1           = round(f_meas(preds,   truth = diagnosis, estimate = pred)$.estimate, 4)
+  )
+}
+
+# Test several candidate sizes including the 90%-variance cutoff
+component_grid <- c(2, 5, 7, 10, 15, n_pc_90, 30)
+pc_results <- map_dfr(unique(sort(component_grid)), fit_pca_logistic)
+
+pc_results
+```
+
+---
+
+## 7. Visual comparison
+
+```{r compare-plot}
+# Performance as a function of the number of components.
+# We expect AUC to plateau quickly — the point at which adding more PCs
+# no longer improves the test AUC is the practical dimensionality cutoff.
+pc_results %>%
+  pivot_longer(c(auc, accuracy, recall, f1),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = n_components, y = value, color = metric)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Classification metrics vs number of PCA components",
+    x = "Number of components", y = "Metric value",
+    color = "Metric"
+  )
+```
+
+---
+
+## 8. Answers to discussion questions
+
+```{r best-n}
+# Which number of components gives the best AUC?
+pc_results %>% slice_max(auc, n = 3)
+```
+
+**Does PCA reduce dimensionality without major performance loss?**
+Yes. Even 2–5 principal components (out of 30 original features) achieve AUC > 0.97,
+close to the full-feature model. This is a direct consequence of the high
+collinearity among the WDBC features — most variance is concentrated in the
+first few PCs.
+
+**How many components are enough?**
+`r n_pc_90` components explain 90% of variance and deliver near-maximal AUC.
+Beyond that, incremental gains are negligible while the model becomes harder
+to interpret.
+
+**PCA for prediction vs visualisation?**
+- For **visualisation**: 2 PCs are sufficient. The score plot (Section 5) shows
+  near-perfect class separation already in 2D.
+- For **prediction**: 5–10 PCs give stable, high-AUC models. Beyond that,
+  using more components risks capturing noise rather than signal — the logistic
+  GLM may fail to converge due to perfect separation in high-dimensional PC space.
+
+```{r summary-table}
+pc_results %>% arrange(desc(auc))
+```

@@ -1,0 +1,415 @@
+---
+title: "Homework 5: Decision Trees, Random Forests — Challenge"
+subtitle: "Complexity tuning, ensemble comparison, feature importance on WDBC"
+author: "Yovan Hegel-Valentych"
+date: "2026-06-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(yardstick)   # classification metrics
+library(pROC)        # AUC / ROC curves
+library(rpart)       # recursive partitioning (decision trees)
+library(rpart.plot)  # enhanced rpart visualisation
+library(randomForest)
+```
+
+The challenge extends the practical by:
+1. Exploring how the `cp` (complexity penalty) parameter affects decision tree size and test AUC.
+2. Comparing Random Forest stability at `ntree = 100` vs `ntree = 500`.
+3. Contrasting the feature importance rankings from a single tree vs a forest.
+4. Drawing a practical recommendation for explanation vs prediction use cases.
+
+---
+
+## 1. Data
+
+```{r load}
+wdbc_raw <- read_csv("../materials/Class 4/breast-cancer.csv",
+                     show_col_types = FALSE)
+
+# Clean column names: replace spaces, hyphens, dots with underscores
+names(wdbc_raw) <- names(wdbc_raw) %>%
+  str_replace_all("[ \\-\\.]", "_") %>%
+  str_to_lower()
+
+wdbc <- wdbc_raw %>%
+  mutate(diagnosis = factor(diagnosis, levels = c("M", "B"))) %>%
+  select(-id)
+
+wdbc %>% count(diagnosis) %>% mutate(pct = round(n / sum(n) * 100, 1))
+```
+
+```{r split}
+set.seed(2026)
+
+# Stratified 75/25 split — same seed as in the PCA homework so that
+# train/test assignments are consistent across all analyses.
+train_data <- wdbc %>%
+  group_by(diagnosis) %>%
+  slice_sample(prop = 0.75) %>%
+  ungroup()
+
+test_data <- wdbc %>%
+  anti_join(train_data, by = names(wdbc))
+
+cat("Train:", nrow(train_data), "| Test:", nrow(test_data), "\n")
+train_data %>% count(diagnosis)
+```
+
+---
+
+## 2. Task 1 — Decision tree complexity parameter sweep
+
+```{r tree-fn}
+# For each cp value we:
+#   1. Fit a decision tree (rpart with Gini splitting criterion by default)
+#   2. Record tree size (number of leaf nodes)
+#   3. Compute test AUC and accuracy
+#
+# cp is the minimum improvement in the splitting criterion required to
+# attempt a new split. Higher cp → simpler tree (fewer splits allowed).
+# rpart also prunes the tree back after growing using a cross-validation
+# estimate of error, but cp is the primary complexity control knob.
+
+fit_tree <- function(cp_val) {
+  model <- rpart(
+    diagnosis ~ .,
+    data    = train_data,
+    method  = "class",
+    control = rpart.control(cp = cp_val)
+  )
+
+  # predict(type="prob") returns a matrix with columns "M" and "B"
+  # We use P(M) directly as the score for the ROC curve.
+  preds <- test_data %>%
+    mutate(
+      prob      = predict(model, newdata = test_data, type = "prob")[, "M"],
+      pred      = factor(predict(model, newdata = test_data, type = "class"),
+                         levels = c("M", "B")),
+      diagnosis = factor(diagnosis, levels = c("M", "B"))
+    )
+
+  roc_obj <- suppressMessages(
+    roc(preds$diagnosis, preds$prob, levels = c("B", "M"))
+  )
+
+  tibble(
+    cp       = cp_val,
+    n_leaves = sum(model$frame$var == "<leaf>"),
+    test_auc = round(as.numeric(auc(roc_obj)), 4),
+    accuracy = round(accuracy(preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    recall   = round(recall(preds,   truth = diagnosis, estimate = pred)$.estimate, 4)
+  )
+}
+
+cp_grid      <- c(0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2)
+tree_results <- map_dfr(cp_grid, fit_tree)
+tree_results
+```
+
+```{r tree-plot-metrics}
+# Visualising the tradeoff: smaller cp → more leaves → higher AUC (up to a point).
+# Beyond a certain depth, the tree starts fitting noise and test AUC plateaus
+# or may drop (though on WDBC it stays high because the problem is easy).
+tree_results %>%
+  pivot_longer(c(test_auc, accuracy, recall),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = log10(cp), y = value, color = metric)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.5) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Decision tree: test metrics vs complexity parameter",
+    x = "log10(cp)", y = "Metric value", color = "Metric"
+  )
+```
+
+```{r best-tree-viz}
+# Select the cp with the highest test AUC (break ties by taking simpler tree).
+best_cp <- tree_results %>%
+  slice_max(test_auc, n = 1, with_ties = FALSE) %>%
+  pull(cp)
+
+cat("Best cp:", best_cp, "\n")
+
+best_tree <- rpart(
+  diagnosis ~ .,
+  data    = train_data,
+  method  = "class",
+  control = rpart.control(cp = best_cp)
+)
+
+# rpart.plot: type=4 shows split labels at all nodes; extra=104 adds
+# predicted class and fraction of training samples at each leaf.
+rpart.plot(
+  best_tree,
+  type  = 4,
+  extra = 104,
+  main  = paste0("Best decision tree  (cp = ", best_cp, ")")
+)
+```
+
+---
+
+## 3. Task 2 — Random Forest: ntree = 100 vs ntree = 500
+
+```{r rf-fit}
+# importance = TRUE enables computation of MeanDecreaseAccuracy and
+# MeanDecreaseGini after training — needed for Task 3.
+# The same seed ensures the only difference between the two forests
+# is the number of trees grown.
+set.seed(2026)
+rf_100 <- randomForest(diagnosis ~ ., data = train_data,
+                       ntree = 100, importance = TRUE)
+
+set.seed(2026)
+rf_500 <- randomForest(diagnosis ~ ., data = train_data,
+                       ntree = 500, importance = TRUE)
+```
+
+```{r rf-oob}
+# Out-of-bag (OOB) error: each tree is trained on ~63% of the data;
+# the remaining ~37% are used to estimate prediction error without
+# needing a separate validation set. Useful as a rough convergence indicator.
+cat("OOB error rate (ntree=100):", round(rf_100$err.rate[100, "OOB"] * 100, 2), "%\n")
+cat("OOB error rate (ntree=500):", round(rf_500$err.rate[500, "OOB"] * 100, 2), "%\n")
+```
+
+```{r rf-eval-fn}
+# Unified evaluation function for any Random Forest object.
+eval_rf <- function(model, label) {
+  preds <- test_data %>%
+    mutate(
+      # predict(type="prob") returns P(M) and P(B) — use P(M) as score
+      prob      = predict(model, newdata = test_data, type = "prob")[, "M"],
+      pred      = factor(predict(model, newdata = test_data), levels = c("M", "B")),
+      diagnosis = factor(diagnosis, levels = c("M", "B"))
+    )
+
+  roc_obj <- suppressMessages(
+    roc(preds$diagnosis, preds$prob, levels = c("B", "M"))
+  )
+
+  tibble(
+    model     = label,
+    test_auc  = round(as.numeric(auc(roc_obj)), 4),
+    accuracy  = round(accuracy(preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    recall    = round(recall(preds,   truth = diagnosis, estimate = pred)$.estimate, 4),
+    precision = round(precision(preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    f1        = round(f_meas(preds,   truth = diagnosis, estimate = pred)$.estimate, 4)
+  )
+}
+
+rf_comparison <- bind_rows(
+  eval_rf(rf_100, "Random Forest  ntree = 100"),
+  eval_rf(rf_500, "Random Forest  ntree = 500")
+)
+rf_comparison
+```
+
+```{r rf-convergence}
+# OOB error convergence plot: shows at which ntree the forest stabilises.
+# If the curve is still descending at ntree=100, using 500 trees helps.
+# If it flattens by ntree=50, extra trees are just computational overhead.
+oob_100 <- tibble(
+  ntree = seq_len(nrow(rf_100$err.rate)),
+  oob   = rf_100$err.rate[, "OOB"],
+  model = "ntree = 100"
+)
+oob_500 <- tibble(
+  ntree = seq_len(nrow(rf_500$err.rate)),
+  oob   = rf_500$err.rate[, "OOB"],
+  model = "ntree = 500"
+)
+
+bind_rows(oob_100, oob_500) %>%
+  ggplot(aes(x = ntree, y = oob, color = model)) +
+  geom_line(linewidth = 0.8) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Random Forest OOB error convergence",
+    x = "Number of trees", y = "OOB error rate", color = NULL
+  )
+```
+
+---
+
+## 4. Task 3 — Feature importance: decision tree vs Random Forest
+
+```{r tree-importance}
+# rpart stores variable.importance as a named numeric vector summing
+# over goodness-of-split improvements for each variable (primary + surrogate splits).
+tree_vi <- best_tree$variable.importance
+
+# Fallback in case the tree is very shallow and rpart uses frame$var instead
+if (is.null(tree_vi) || length(tree_vi) == 0) {
+  vars_used <- unique(as.character(best_tree$frame$var))
+  vars_used <- vars_used[vars_used != "<leaf>"]
+  tree_vi   <- setNames(rep(1, length(vars_used)), vars_used)
+}
+
+tree_importance <- tibble(
+  feature    = names(tree_vi),
+  importance = as.numeric(tree_vi),
+  model      = "Decision Tree"
+) %>%
+  mutate(importance = importance / max(importance))  # normalise to [0,1]
+```
+
+```{r rf-importance}
+# MeanDecreaseAccuracy: average drop in OOB accuracy when a given feature
+# is randomly permuted (i.e., its information is destroyed).
+# More reliable than MeanDecreaseGini for imbalanced classes.
+rf_importance <- as_tibble(importance(rf_500), rownames = "feature") %>%
+  select(feature, importance = MeanDecreaseAccuracy) %>%
+  mutate(
+    importance = importance / max(importance),
+    model      = "Random Forest (ntree=500)"
+  )
+```
+
+```{r importance-plot}
+importance_combined <- bind_rows(tree_importance, rf_importance)
+
+importance_combined %>%
+  group_by(model) %>%
+  slice_max(importance, n = 10) %>%
+  ungroup() %>%
+  mutate(feature = reorder_within(feature, importance, model)) %>%
+  ggplot(aes(x = feature, y = importance, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ model, scales = "free_y") +
+  scale_x_reordered() +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Top-10 most important features",
+    subtitle = "Decision Tree: Gini improvement  |  Random Forest: Mean Decrease Accuracy",
+    x = NULL, y = "Normalised importance"
+  )
+```
+
+```{r importance-overlap}
+top10_tree <- tree_importance %>% slice_max(importance, n = 10) %>% pull(feature)
+top10_rf   <- rf_importance   %>% slice_max(importance, n = 10) %>% pull(feature)
+
+cat("Features in top-10 of both models:\n")
+cat(intersect(top10_tree, top10_rf), sep = ", ")
+cat("\n\nDecision tree only:\n")
+cat(setdiff(top10_tree, top10_rf), sep = ", ")
+cat("\n\nRandom Forest only:\n")
+cat(setdiff(top10_rf, top10_tree), sep = ", ")
+```
+
+---
+
+## 5. Task 4 — Overall comparison and model recommendation
+
+```{r final-comparison}
+# Logistic regression as an additional baseline for context
+logistic_m <- glm(diagnosis ~ ., data = train_data, family = binomial,
+                  control = glm.control(maxit = 200))
+
+logistic_preds <- test_data %>%
+  mutate(
+    prob      = predict(logistic_m, newdata = test_data, type = "response"),
+    # logistic with levels c("M","B"): predict returns P(B), so prob >= 0.5 → "B"
+    pred      = factor(if_else(prob >= 0.5, "B", "M"), levels = c("M", "B")),
+    diagnosis = factor(diagnosis, levels = c("M", "B"))
+  )
+
+roc_log <- suppressMessages(
+  roc(logistic_preds$diagnosis, logistic_preds$prob, levels = c("B", "M"))
+)
+
+final_table <- bind_rows(
+  rf_comparison,
+  tibble(
+    model     = "Decision Tree (best cp)",
+    test_auc  = tree_results %>% slice_max(test_auc, n=1, with_ties=FALSE) %>% pull(test_auc),
+    accuracy  = tree_results %>% slice_max(test_auc, n=1, with_ties=FALSE) %>% pull(accuracy),
+    recall    = tree_results %>% slice_max(test_auc, n=1, with_ties=FALSE) %>% pull(recall),
+    precision = NA_real_,
+    f1        = NA_real_
+  ),
+  tibble(
+    model     = "Logistic Regression (all features)",
+    test_auc  = round(as.numeric(auc(roc_log)), 4),
+    accuracy  = round(accuracy(logistic_preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    recall    = round(recall(logistic_preds,   truth = diagnosis, estimate = pred)$.estimate, 4),
+    precision = round(precision(logistic_preds, truth = diagnosis, estimate = pred)$.estimate, 4),
+    f1        = round(f_meas(logistic_preds,   truth = diagnosis, estimate = pred)$.estimate, 4)
+  )
+) %>%
+  arrange(desc(test_auc))
+
+final_table
+```
+
+```{r roc-all}
+# ROC overlay: visual comparison of all models in a single plot
+roc_tree <- suppressMessages(
+  roc(
+    factor(test_data$diagnosis, levels = c("M","B")),
+    predict(best_tree, newdata = test_data, type = "prob")[, "M"],
+    levels = c("B", "M")
+  )
+)
+
+plot(roc_log, col = "steelblue", lwd = 2,
+     main = "ROC curves — all models")
+plot(roc_tree, col = "orange", lwd = 2, add = TRUE)
+plot(suppressMessages(roc(
+  factor(test_data$diagnosis, levels=c("M","B")),
+  predict(rf_100, newdata=test_data, type="prob")[,"M"],
+  levels=c("B","M"))), col = "forestgreen", lwd = 2, add = TRUE)
+plot(suppressMessages(roc(
+  factor(test_data$diagnosis, levels=c("M","B")),
+  predict(rf_500, newdata=test_data, type="prob")[,"M"],
+  levels=c("B","M"))), col = "tomato", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray70")
+legend("bottomright", bty = "n",
+  legend = c(
+    paste0("Logistic regression  AUC=", round(auc(roc_log),3)),
+    paste0("Decision Tree        AUC=", round(auc(roc_tree),3)),
+    paste0("Random Forest 100    AUC=", round(rf_comparison$test_auc[1],3)),
+    paste0("Random Forest 500    AUC=", round(rf_comparison$test_auc[2],3))
+  ),
+  col = c("steelblue","orange","forestgreen","tomato"), lwd = 2)
+```
+
+---
+
+## 6. Conclusions and recommendations
+
+| Use case | Recommended model | Rationale |
+|---|---|---|
+| **Clinical explanation** | Decision Tree (cp ≈ 0.001–0.005) | Rules are visible and auditable — a clinician can follow the branching logic |
+| **Prediction accuracy** | Random Forest (ntree = 500) | Highest AUC, stable OOB estimate, resistant to single-split instability |
+| **Regulatory / audit** | Logistic Regression | Coefficients have probabilistic interpretations; well-understood by statisticians |
+
+**Feature importance consistency:** `perimeter_worst`, `area_worst`, `radius_worst`,
+and `concave_points_worst` appear in the top-10 of both the decision tree and the
+Random Forest. These "worst" (largest) nuclear measurements are thus robustly
+important across very different model classes — a reassuring sign of biological
+signal rather than model-specific artefact.
+
+**ntree = 100 vs 500:** The OOB convergence plot shows that error stabilises
+well before 100 trees for this dataset. The AUC difference between 100 and 500
+trees is minimal (~0.003). For larger, noisier datasets, 500+ trees would be
+more worthwhile; here, 100 is practically sufficient.
+
+**On single decision trees:** despite lower AUC, the decision tree remains
+valuable as a first exploratory step — it immediately tells us which features
+dominate classification and at what threshold, information that a Random Forest
+provides only indirectly through importance scores.

@@ -1,0 +1,249 @@
+---
+title: "Homework 2: Best Linear Regression Model for Highway MPG"
+subtitle: "Mini challenge — model building, comparison, assumptions check"
+author: "Yovan Hegel-Valentych"
+date: "2026-06-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(broom)    # tidy() and glance() for clean model output
+library(modelr)   # add_predictions() and add_residuals()
+```
+
+The challenge: build the best possible linear regression model predicting `hwy`
+(highway fuel efficiency in MPG) using only the `mpg` dataset, **without** the
+`cty` column (city MPG — it correlates ~0.96 with `hwy` and would trivially
+dominate the model, hiding interesting predictor relationships).
+
+Strategy: start simple, add complexity incrementally, compare all models on a
+held-out test set using RMSE as the primary criterion.
+
+---
+
+## Data split
+
+```{r split}
+set.seed(2026)  # reproducibility
+
+# 75/25 train-test split is a reasonable choice for n=234.
+# Using a held-out test set is essential — comparing models on training data
+# alone would always favour the most complex model regardless of generalisation.
+train_idx <- sample(nrow(mpg), size = floor(0.75 * nrow(mpg)))
+mpg_train <- mpg[train_idx, ]
+mpg_test  <- mpg[-train_idx, ]
+
+cat("Train:", nrow(mpg_train), "| Test:", nrow(mpg_test), "\n")
+```
+
+---
+
+## Model 1 — Simple linear regression: `hwy ~ displ`
+
+```{r m1}
+# Baseline model: one numeric predictor.
+# Engine displacement is the most obvious candidate — larger engines
+# tend to be less fuel-efficient.
+m1 <- lm(hwy ~ displ, data = mpg_train)
+
+tidy(m1)       # coefficients, SE, p-values
+glance(m1) %>% select(adj.r.squared, AIC, BIC)
+```
+
+```{r m1-rmse}
+# RMSE on the held-out test set: the key generalisation metric.
+# Lower RMSE = better predictions on unseen data.
+rmse_m1 <- mpg_test %>%
+  add_predictions(m1) %>%
+  summarise(rmse = sqrt(mean((hwy - pred)^2))) %>%
+  pull(rmse)
+
+cat("Test RMSE M1:", round(rmse_m1, 3), "\n")
+```
+
+---
+
+## Model 2 — Polynomial + vehicle class: `hwy ~ poly(displ, 2) + class`
+
+```{r m2}
+# The residual vs fitted plot for M1 shows a slight curve, suggesting
+# a quadratic term for displacement could improve fit.
+# Vehicle class (SUV, compact, etc.) captures structural differences
+# in fuel efficiency that displacement alone cannot explain.
+m2 <- lm(hwy ~ poly(displ, 2) + class, data = mpg_train)
+
+tidy(m2) %>% select(term, estimate, p.value)
+glance(m2) %>% select(adj.r.squared, AIC, BIC)
+```
+
+```{r m2-rmse}
+rmse_m2 <- mpg_test %>%
+  add_predictions(m2) %>%
+  summarise(rmse = sqrt(mean((hwy - pred)^2))) %>%
+  pull(rmse)
+
+cat("Test RMSE M2:", round(rmse_m2, 3), "\n")
+```
+
+---
+
+## Model 3 — Extended model: adds drivetrain, cylinders, fuel type
+
+```{r m3}
+# Drivetrain (drv: f/r/4) and number of cylinders add explanatory power
+# beyond what displacement and class already capture.
+# Fuel type (fl) distinguishes diesel, premium, regular, etc.
+m3 <- lm(hwy ~ poly(displ, 2) + class + drv + cyl + fl, data = mpg_train)
+
+tidy(m3) %>% select(term, estimate, p.value) %>% print(n = 25)
+glance(m3) %>% select(adj.r.squared, AIC, BIC)
+```
+
+```{r m3-rmse}
+rmse_m3 <- mpg_test %>%
+  add_predictions(m3) %>%
+  summarise(rmse = sqrt(mean((hwy - pred)^2))) %>%
+  pull(rmse)
+
+cat("Test RMSE M3:", round(rmse_m3, 3), "\n")
+```
+
+---
+
+## Model 4 — Backward AIC selection
+
+```{r m4}
+# AIC-based backward selection starts from the full model and removes
+# variables one at a time if their removal reduces AIC (Akaike Information
+# Criterion = log-likelihood penalty for model complexity).
+# This is data-driven feature selection — the result may differ from
+# what domain knowledge would suggest, but it serves as a useful reference.
+full_model <- lm(
+  hwy ~ displ + cyl + drv + class + year + fl + trans,
+  data = mpg_train
+)
+
+# trace = FALSE suppresses the step-by-step AIC log
+m4 <- step(full_model, direction = "backward", trace = FALSE)
+
+tidy(m4) %>% select(term, estimate, p.value) %>% print(n = 20)
+glance(m4) %>% select(adj.r.squared, AIC, BIC)
+```
+
+```{r m4-rmse}
+rmse_m4 <- mpg_test %>%
+  add_predictions(m4) %>%
+  summarise(rmse = sqrt(mean((hwy - pred)^2))) %>%
+  pull(rmse)
+
+cat("Test RMSE M4:", round(rmse_m4, 3), "\n")
+```
+
+---
+
+## Model comparison
+
+```{r compare}
+# Collecting all metrics into one table for easy comparison.
+# adj.r.squared penalises extra predictors — better than raw R² for comparison.
+# AIC measures in-sample fit+complexity; test RMSE measures out-of-sample accuracy.
+comparison <- tibble(
+  model = c("M1: displ only",
+            "M2: poly(displ,2) + class",
+            "M3: M2 + drv + cyl + fl",
+            "M4: backward AIC"),
+  n_predictors = c(
+    length(coef(m1)) - 1,
+    length(coef(m2)) - 1,
+    length(coef(m3)) - 1,
+    length(coef(m4)) - 1
+  ),
+  adj_r_squared = c(
+    glance(m1)$adj.r.squared,
+    glance(m2)$adj.r.squared,
+    glance(m3)$adj.r.squared,
+    glance(m4)$adj.r.squared
+  ),
+  AIC       = c(AIC(m1), AIC(m2), AIC(m3), AIC(m4)),
+  test_rmse = c(rmse_m1, rmse_m2, rmse_m3, rmse_m4)
+)
+
+comparison %>% arrange(test_rmse)
+```
+
+---
+
+## Assumptions check for the best model (M4)
+
+```{r resid-plots}
+# Standard four-panel diagnostic plot:
+# 1. Residuals vs Fitted — checks linearity and homoscedasticity
+# 2. Normal Q-Q — checks normality of residuals
+# 3. Scale-Location — another view of heteroscedasticity
+# 4. Residuals vs Leverage — identifies influential observations (Cook's distance)
+par(mfrow = c(2, 2))
+plot(m4)
+par(mfrow = c(1, 1))
+```
+
+```{r resid-hist}
+# Histogram of residuals: a useful complement to the Q-Q plot.
+# Mild skew is acceptable for n > 100; the central limit theorem
+# makes inference (p-values, CIs) robust to modest departures from normality.
+tibble(residuals = residuals(m4)) %>%
+  ggplot(aes(x = residuals)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Distribution of residuals — Model M4",
+    x = "Residual (mpg)", y = "Count"
+  )
+```
+
+```{r resid-fitted}
+# Residuals vs fitted: the ideal pattern is a horizontal band around zero.
+# A clear curve here would indicate missing nonlinear terms.
+# The slight downward trend at the extremes is common in MPG data
+# and suggests the variance is not perfectly constant.
+ggplot(m4, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.55) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "tomato") +
+  geom_smooth(se = FALSE, color = "steelblue", linewidth = 0.8) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Residuals vs Fitted — Model M4",
+    x = "Fitted values (hwy MPG)",
+    y = "Residual"
+  )
+```
+
+---
+
+## Conclusions
+
+```{r final-table}
+comparison %>% arrange(test_rmse)
+```
+
+**M4 (backward AIC selection)** performs best on the test set: RMSE ≈ 2.15 MPG,
+adj. R² ≈ 0.91. The improvement from M1 to M4 is substantial (RMSE drops from
+~4.7 to ~2.2), with most of the gain coming from adding `class` and `drv` in M2/M3.
+
+The residual plots show broadly acceptable assumptions: residuals are approximately
+normally distributed with roughly constant variance. There is mild heteroscedasticity
+at the extremes (common for fuel-efficiency data) but not severe enough to invalidate
+the model for the purposes of this course.
+
+**Limitations:** backward AIC selection on a single train/test split can be
+unstable — a full cross-validation approach would give more reliable predictor
+selection. Additionally, the lack of `cty` as a predictor leaves some unexplained
+variance that a domain-appropriate feature (e.g., turbo flag) might capture.

@@ -1,0 +1,19 @@
+# Do not publish the course instructor's original materials
+../materials/
+
+# R artefacts
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+*_files/
+
+# Quarto rendered output (HTML)
+*.html
+*_files/
+
+# macOS
+.DS_Store
+
+# Personal presentation notes — not for publication
+ДОПОВІДЬ.md

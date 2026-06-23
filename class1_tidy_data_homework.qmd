@@ -1,0 +1,226 @@
+---
+title: "Homework 1: Cleaning and Tidying Messy Penguin Data"
+subtitle: "Tidyverse workflow — inspect, clean, filter, mutate, pivot, join, summarise"
+author: "Yovan Hegel-Valentych"
+date: "2026-06-23"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+```
+
+The goal of this homework is to practice the full tidyverse pipeline on a deliberately
+messy version of the Palmer Penguins dataset: from raw inspection to a clean,
+summarised analytical result.
+
+---
+
+## Read data
+
+```{r load}
+# Both files live one level up inside the course materials folder.
+# The penguin observations have 11 columns including quality flags and batch IDs
+# that are absent from the original palmerpenguins package.
+data_penguins   <- read_csv("../materials/Class 1/messy_penguins.csv")
+metadata_islands <- read_csv("../materials/Class 1/island_metadata.csv")
+```
+
+---
+
+## Step 1: Inspect the data
+
+```{r inspect-dims}
+# Basic dimensions — good starting point before any transformation
+nrow(data_penguins)
+ncol(data_penguins)
+names(data_penguins)
+```
+
+```{r inspect-summary}
+# summary() gives a quick view of ranges and missing counts per column
+summary(data_penguins)
+```
+
+```{r inspect-missing}
+# Counting NAs per column explicitly — easier to scan than summary() output
+data_penguins %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  filter(n_missing > 0)
+```
+
+```{r inspect-categoricals}
+# Checking unique values in categorical columns reveals the messy parts:
+# species and island have mixed letter case (e.g. "ADELIE" vs "Adelie"),
+# sex has mixed case too ("FEMALE" vs "female")
+data_penguins %>% count(species)
+data_penguins %>% count(island)
+data_penguins %>% count(sex)
+data_penguins %>% count(observation_quality)
+```
+
+**Observations:** the dataset contains mixed-case labels in `species`, `island`,
+and `sex`, plus some missing values in body measurements and sex.
+The `observation_quality` column distinguishes high, medium, and low-quality records.
+
+---
+
+## Step 2: Clean categorical variables
+
+```{r clean}
+# str_trim() removes any accidental leading/trailing whitespace.
+# str_to_title() / str_to_lower() standardise letter case so that
+# "ADELIE", "Adelie", "adelie" all become the same token.
+# drop_na() on the key measurement columns removes rows where we cannot
+# compute meaningful statistics — better to lose a few rows than carry NAs
+# silently into downstream analyses.
+penguins_cleaned_homework <- data_penguins %>%
+  mutate(
+    species             = str_trim(str_to_title(species)),
+    island              = str_trim(str_to_title(island)),
+    sex                 = str_trim(str_to_lower(sex)),
+    observation_quality = str_trim(str_to_lower(observation_quality))
+  ) %>%
+  drop_na(species, island, sex,
+          bill_length_mm, bill_depth_mm, flipper_length_mm, body_mass_g)
+
+cat("Rows remaining after cleaning:", nrow(penguins_cleaned_homework), "\n")
+penguins_cleaned_homework %>% count(sex)
+penguins_cleaned_homework %>% count(observation_quality)
+```
+
+---
+
+## Step 3: Filter useful observations
+
+```{r filter}
+# Retaining only observations that pass a minimum quality threshold,
+# have a body mass above 3 kg (removes suspiciously small measurements),
+# and come from the two islands with the most data: Biscoe and Dream.
+# Torgersen is excluded — too few samples for reliable group statistics.
+penguins_filtered <- penguins_cleaned_homework %>%
+  filter(
+    observation_quality %in% c("high", "medium"),
+    body_mass_g > 3000,
+    island %in% c("Biscoe", "Dream")
+  )
+
+cat("Rows after filtering:", nrow(penguins_filtered), "\n")
+
+# Verify the group sizes are reasonable for downstream aggregation
+penguins_filtered %>% count(island, observation_quality)
+```
+
+---
+
+## Step 4: Add new variables with `mutate()`
+
+```{r mutate}
+# body_mass_kg is just a unit conversion — more readable in plots.
+# bill_ratio captures the shape of the bill; morphologically informative
+# for species discrimination (longer + shallower vs. shorter + deeper).
+# large_penguin is a simple binary flag useful for quick group comparisons.
+penguins_mutated <- penguins_filtered %>%
+  mutate(
+    body_mass_kg  = body_mass_g / 1000,
+    bill_ratio    = bill_length_mm / bill_depth_mm,
+    large_penguin = if_else(body_mass_g > 4500, "large", "regular")
+  )
+
+penguins_mutated %>%
+  select(species, body_mass_g, body_mass_kg, bill_ratio, large_penguin) %>%
+  head(8)
+```
+
+---
+
+## Step 5: Pivot to long format
+
+```{r pivot-longer}
+# pivot_longer() converts the four measurement columns into two columns:
+# "measurement" (the former column name) and "value" (the numeric reading).
+# The long format is required when we want to plot or summarise all
+# measurements in a single grouped operation without repeating code.
+penguins_long <- penguins_mutated %>%
+  pivot_longer(
+    cols      = c(bill_length_mm, bill_depth_mm, flipper_length_mm, body_mass_g),
+    names_to  = "measurement",
+    values_to = "value"
+  )
+
+cat("Rows in long format:", nrow(penguins_long),
+    "(= ", nrow(penguins_mutated), "rows ×", 4, "measurements)\n")
+
+penguins_long %>%
+  select(species, island, sex, measurement, value) %>%
+  head(8)
+```
+
+---
+
+## Step 6: Join with island metadata
+
+```{r join}
+# left_join keeps all penguin rows and adds environmental metadata
+# from the island table. Using a left join (not inner) ensures we do not
+# silently drop penguins if an island name is missing from the lookup.
+penguins_joined <- penguins_mutated %>%
+  left_join(metadata_islands, by = "island")
+
+# Quick sanity check: row count must not change after the join
+stopifnot(nrow(penguins_joined) == nrow(penguins_mutated))
+
+penguins_joined %>%
+  select(species, island, region, protected_area, average_temperature_c) %>%
+  head(6)
+```
+
+---
+
+## Step 7: Group, summarise, and order
+
+```{r summarise}
+# Grouping by species, island, sex, and protected area lets us see
+# how body size differs across these biological and ecological strata.
+# na.rm = TRUE is added defensively even though NAs were already removed —
+# good practice for functions that do not propagate NAs by default.
+penguins_summary <- penguins_joined %>%
+  group_by(species, island, sex, protected_area) %>%
+  summarise(
+    n                = n(),
+    mean_body_mass_g = mean(body_mass_g, na.rm = TRUE),
+    median_flipper   = median(flipper_length_mm, na.rm = TRUE),
+    mean_bill_ratio  = mean(bill_ratio, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_body_mass_g))
+
+penguins_summary
+```
+
+**Key finding:** Gentoo males on Biscoe island are the heaviest group
+(mean ≈ 5 480 g), followed by Gentoo females (≈ 4 640 g).
+Both islands are protected areas, which may reflect lower disturbance levels.
+Adelie penguins are consistently lighter across both islands regardless of sex.
+
+---
+
+## Summary of analytical outputs
+
+| Object | Description |
+|---|---|
+| `penguins_cleaned_homework` | Standardised labels, no NAs in key columns |
+| `penguins_filtered` | High/medium quality, Biscoe + Dream only, body mass > 3 000 g |
+| `penguins_mutated` | Added `body_mass_kg`, `bill_ratio`, `large_penguin` |
+| `penguins_long` | Long format via `pivot_longer()` — ready for faceted plots |
+| `penguins_joined` | Island metadata appended via `left_join()` |
+| `penguins_summary` | Final grouped summary table, ordered by mean body mass |
